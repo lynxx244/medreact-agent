@@ -1,0 +1,36 @@
+# API Key 保护（最重要）
+.env
+*.env
+config.py
+secrets.py
+
+# 原始数据集（体积大，不上传）
+data/test_datasets.jsonl
+
+# 评估结果（中间产物，不上传）
+results/
+
+# Python 缓存
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# 虚拟环境
+venv/
+env/
+.venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Windows
+Thumbs.db
+Desktop.ini
+
+# macOS
+.DS_Store
