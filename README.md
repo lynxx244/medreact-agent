@@ -1,196 +1,174 @@
 # MedReAct：基于 ReAct 框架的医疗预问诊 Agent
 
-基于 [ReAct 论文](https://arxiv.org/abs/2210.03629) 从零实现的医疗预问诊 Agent，使用 DeepSeek API，配套完整评估体系与消融实验。
+> 从零实现的医疗分诊 Agent，核心目标：在保证整体准确率的前提下，最大化高风险患者的识别召回率。
+
+**GitHub**: https://github.com/lynxx244/medreact-agent
+
+---
+
+## 项目背景
+
+传统 LLM 直接判断患者症状风险等级存在明显缺陷：**高风险患者召回率为 0%**——模型倾向于给出保守的低/中风险结论，容易漏掉真正需要急诊的患者。
+
+本项目基于 ReAct 论文（Yao et al., 2022）从零手写一个医疗预问诊 Agent，通过多轮推理、工具调用和 RAG 知识库检索，将高风险召回率从 0% 提升至 **63.6%**。
+
+---
+
+## 系统架构
+
+```
+患者描述
+    ↓
+┌─────────────────────────────────┐
+│         MedReAct Agent          │
+│                                 │
+│  Thought → Action → Observation │
+│       ↑________________↓        │
+│                                 │
+│  工具1: ask_patient（追问症状）   │
+│  工具2: search_symptom（RAG检索）│
+│  工具3: risk_assess（风险评估）  │
+│                                 │
+│  安全二次校验（低/中风险兜底）    │
+└─────────────────────────────────┘
+    ↓
+Final Answer（风险等级 + 建议）
+```
+
+**技术栈**：DeepSeek API + FAISS + BGE-base-zh-v1.5 + 华佗26M医学数据集
+
+---
+
+## 核心技术挑战与解决思路
+
+### 挑战一：高风险患者大量漏诊
+
+**问题**：基于关键词的风险评估只能识别急性红旗症状（休克、意识丧失等），无法识别"黑便可能消化道出血"、"肩背痛可能肺癌转移"等潜在严重疾病信号。
+
+**分析**：`risk_assess` 收到的症状列表是患者的表面描述，缺乏医学背景知识的支撑。
+
+**解决**：
+1. 构建 FAISS 向量知识库（华佗26M数据集，6000条医学问答，排除测试集避免数据泄露）
+2. 将 `search_symptom` 的检索结果作为 `kb_context` 传入 `risk_assess`
+3. LLM 结合患者症状 + 知识库信息综合判断，不再依赖固定关键词列表
+4. 新增"潜在严重疾病信号"判断维度（便血、痰中带血、不明原因消瘦等）
+
+**效果**：高风险召回率从 27.3% → **63.6%**（+136%）
+
+---
+
+### 挑战二：ground truth 标注噪声
+
+**问题**：规则关键词标注导致大量误标——"手术"、"住院"出现在任何语境（历史手术、慢性病复诊）都会被标为高风险，导致评估结果虚高。
+
+**发现**：规则标注下高风险样本占 62/200（31%），其中"小腿减肥"、"看书眼睛痛"被误标为高风险。
+
+**解决**：改用 LLM 标注，高风险样本降至 35/200（17.5%），分布更符合真实医疗场景。
+
+**启示**：v1 的 45.5% 高风险召回率是虚高的，基于准确 ground truth 的 v3 基准为 27.3%，v5 的 63.6% 才是真实的改进效果。
+
+---
+
+### 挑战三：医疗场景的精确率/召回率权衡
+
+**问题**：提高高风险召回率的同时，部分中风险样本被过度升级为高风险（中风险准确率从 29.4% 降至 11.8%）。
+
+**判断**：在医疗场景中，**假阴性（漏诊）的代价远大于假阳性（过度诊断）**——漏掉高风险患者可能危及生命，而多发一次"建议就医"只是让患者多跑一趟医院。因此主动接受这个权衡。
+
+---
+
+## 实验结果
+
+### 消融实验（基于 LLM 标注的60条测试集）
+
+| 指标 | A. 纯LLM | B. 简化Agent | C. MedReAct v3(基准) | D. MedReAct v5(最终) |
+|------|----------|-------------|---------------------|---------------------|
+| 整体准确率 | 60.0% | 51.7% | 50.0% | **61.7%** |
+| **高风险召回率** | **0.0%** | **18.2%** | **27.3%** | **63.6%** |
+| 建议覆盖率 | - | - | 66.9% | 67.8% |
+| 无法解析率 | 0.0% | 0.0% | 0.0% | 0.0% |
+| 平均耗时 | 1.8s | 3.5s | 12.1s | 13.7s |
+
+**核心结论**：
+- MedReAct 高风险召回率是纯 LLM 的无穷倍（0% → 63.6%）
+- RAG 知识库接入是最关键的改进，单步提升召回率 +136%
+- 整体准确率优于所有对照组
+
+---
+
+## 快速启动
+
+### 环境准备
+
+```bash
+pip install faiss-cpu sentence-transformers openai
+```
+
+### 构建知识库
+
+```bash
+# Windows
+$env:HF_ENDPOINT="https://hf-mirror.com"
+python scripts/build_kb.py
+
+# Linux/Mac
+HF_ENDPOINT="https://hf-mirror.com" python scripts/build_kb.py
+```
+
+### 运行 Agent
+
+```python
+from react_agent import MedReActAgent
+agent = MedReActAgent(max_steps=8)
+agent.run("我头痛发烧两天了")
+```
+
+### 运行评估
+
+```bash
+python scripts/evaluate.py \
+  --testset data/testset_labeled_llm.jsonl \
+  --output results/eval.json \
+  --api-key YOUR_API_KEY \
+  --max 60
+```
 
 ---
 
 ## 项目结构
 
 ```
-mdreact_eval/
-├── react_agent.py          # MedReAct Agent 核心实现
+medreact-agent/
+├── react_agent.py          # 核心 Agent（ReAct 循环 + 三个工具）
+├── kb/
+│   ├── kb.index            # FAISS 向量索引
+│   └── answers.json        # 知识库文本
 ├── data/
-│   └── testset_labeled_llm.jsonl   # 评估测试集（规则+LLM双重标注）
+│   ├── testset_labeled_llm.jsonl   # LLM 标注测试集（推荐）
+│   └── test_datasets.jsonl         # 原始华佗数据
 ├── scripts/
-│   ├── build_dataset.py    # 数据预处理：原始数据 → 带标签测试集
-│   ├── evaluate.py         # 评估核心：批量测试 Agent，计算指标
-│   ├── baseline.py         # 消融实验：纯LLM、简化Agent 两个对照组
-│   ├── compare.py          # 生成三组横向对比报告
-│   └── report.py           # 可视化单组评估报告
-└── results/                # 评估报告输出目录（自动生成）
+│   ├── build_kb.py         # 构建 FAISS 知识库
+│   ├── build_dataset.py    # 构建评估测试集
+│   ├── evaluate.py         # 批量评估
+│   ├── baseline.py         # 对照组
+│   └── compare.py          # 横向对比报告
+└── results/                # 评估结果
 ```
 
 ---
 
-## Agent 设计
+## 已知局限与未来工作
 
-MedReAct 实现了标准 ReAct 循环：**Thought → Action → Observation → 循环或 Final Answer**
-
-### 三个工具
-
-| 工具 | 作用 |
-|------|------|
-| `ask_patient(question)` | 向患者追问症状细节，每次只问一个问题 |
-| `risk_assess(symptoms, duration_days)` | 用 LLM 语义判断红旗症状，非关键词匹配 |
-| `search_symptom(query)` | 查询症状相关医学背景知识 |
-
-### 安全机制
-
-Final Answer 输出前强制调用 `risk_assess`，并对低/中风险结论做二次安全校验，防止高风险漏判。
+- **高风险召回率 63.6%**，距目标 80% 仍有差距，需要更大规模知识库
+- **知识库覆盖度有限**，6000条问答无法覆盖所有症状类型
+- **`execute_tool` 使用 `eval()`**，存在安全风险，后期改成参数解析器
+- **测试集仅60条**，样本量偏少，统计显著性有限
+- ground truth 基于 LLM 标注，存在一定噪声
 
 ---
 
-## 快速开始
+## 参考文献
 
-### 安装依赖
-
-```bash
-pip install -r requirements.txt
-```
-
-### 配置 API Key
-
-在 `react_agent.py` 顶部填入你的 DeepSeek API key：
-
-```python
-client = OpenAI(
-    api_key="your_deepseek_api_key",
-    base_url="https://api.deepseek.com"
-)
-```
-
-### 运行 Agent
-
-```bash
-python react_agent.py
-```
-
----
-
-## 评估体系
-
-### Step 1：构建测试集
-
-```bash
-python scripts/build_dataset.py \
-    --input data/test_datasets.jsonl \
-    --output data/testset_labeled_llm.jsonl \
-    --max 200 \
-    --llm-fallback \
-    --api-key YOUR_KEY
-```
-
-### Step 2：评估 MedReAct
-
-```bash
-python scripts/evaluate.py \
-    --testset data/testset_labeled_llm.jsonl \
-    --output results/eval_report_llm.json \
-    --api-key YOUR_KEY \
-    --max 60
-```
-
-### Step 3：运行消融实验
-
-```bash
-python scripts/baseline.py \
-    --testset data/testset_labeled_llm.jsonl \
-    --output results/ \
-    --api-key YOUR_KEY \
-    --max 60
-```
-
-### Step 4：生成对比报告
-
-```bash
-python scripts/compare.py --markdown
-```
-
----
-
-## 实验结果
-
-消融实验基于60条测试样本（来自华佗26M数据集，规则+LLM双重标注）。
-
-### 核心指标对比
-
-| 指标 | A. 纯LLM | B. 简化Agent | C. MedReAct |
-|------|----------|-------------|-------------|
-| 整体准确率 | 60.0% | 51.7% | **55.0%** |
-| **高风险召回率** | **0.0%** | **18.2%** | **45.5%** |
-| 无法解析率 | 0.0% | 0.0% | 0.0% |
-| 平均耗时 | 1.8s | 3.5s | 12.1s |
-
-### 分层准确率
-
-| 风险等级 | A. 纯LLM | B. 简化Agent | C. MedReAct |
-|---------|----------|-------------|-------------|
-| 高风险 | 0.0% (0/11) | 18.2% (2/11) | **45.5% (5/11)** |
-| 中风险 | 76.5% (13/17) | 35.3% (6/17) | 23.5% (4/17) |
-| 低风险 | 71.9% (23/32) | 71.9% (23/32) | 75.0% (24/32) |
-
-### 核心发现
-
-**1. ReAct 多轮推理显著提升高风险识别能力**
-
-高风险召回率随框架复杂度持续提升：纯LLM完全漏判（0%）→ 简化Agent部分识别（18.2%）→ 完整MedReAct（45.5%）。MedReAct 是简化Agent的2.5倍，在医疗场景中这是最关键的差异。
-
-**2. 多轮推理对整体准确率有正向贡献**
-
-MedReAct 整体准确率（55%）优于简化Agent（51.7%），说明追问和搜索工具对准确率有正向贡献，而非引入噪声。
-
-**3. 准确率受 ground truth 标注噪声影响**
-
-基于关键词+LLM 的自动标注存在约 15-20% 噪声。部分案例中 Agent 判断反而比 ground truth 更合理（如术后持续出血+发热被标为中风险，Agent 判为高风险更符合临床实际），实际效果比数字更好。
-
-**4. 安全性提升的代价是响应时间**
-
-MedReAct 耗时（12.1s）是纯LLM（1.8s）的 6.7 倍，适用于对安全性要求高于速度的场景。
-
-### 迭代优化历程
-
-| 版本 | 关键改动 | 无法解析率 |
-|------|---------|-----------|
-| v1 | 基础 ReAct 实现 | 30% |
-| v2 | 强制 Final Answer 格式 | 0% |
-| v3 | risk_assess 降低误触发敏感度 | 0% |
-| v4 | 步数用完强制生成答案 | 0% |
-| v5 | 安全二次校验机制 | 0% |
-| v6 | LLM 解析器兜底 | 0% |
-
----
-
-## 评估指标说明
-
-| 指标 | 说明 | 目标值 |
-|------|------|--------|
-| **高风险召回率** | 高风险案例中被正确识别的比例，漏判代价极大 | > 80% |
-| 整体准确率 | 风险等级判断正确率，受标注噪声影响 | 参考值 |
-| 无法解析率 | Agent 输出格式无法被解析的比例 | < 5% |
-
----
-
-## 数据集
-
-使用 [华佗26M](https://huggingface.co/datasets/FreedomIntelligence/huatuo26M-testdatasets) 测试集，包含真实医患问答对。
-
-ground truth 标注策略：
-- **规则标注**：关键词匹配医生答案，快速且可复现（覆盖约28%样本）
-- **LLM标注**：对规则无法判断的样本用 DeepSeek 补充打标
-
----
-
-## 技术债与后续方向
-
-- [ ] `execute_tool` 使用了 `eval()`，存在安全风险，需改为参数解析器
-- [ ] 高风险召回率仍有提升空间（当前45.5%，目标>80%）
-- [ ] 当前 ground truth 质量有限，可构建人工标注的高质量小测试集
-- [ ] Agent 无跨会话记忆，每次对话独立
-
----
-
-## 依赖
-
-- Python 3.8+
-- openai >= 1.0.0
-- DeepSeek API Key（[申请地址](https://platform.deepseek.com)）
+- ReAct: Synergizing Reasoning and Acting in Language Models (Yao et al., ICLR 2023)
+- 华佗26M医学问答数据集
+- BGE: BAAI General Embedding (Beijing Academy of AI)
