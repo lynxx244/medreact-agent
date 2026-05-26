@@ -1,9 +1,17 @@
 # react_agent.py
 import re
+import faiss
+import json
+import numpy as np
+from sentence_transformers import SentenceTransformer
+
+_model = SentenceTransformer("BAAI/bge-base-zh-v1.5")
+_index = faiss.read_index("kb/kb.index")
+_answers = json.load(open("kb/answers.json", encoding="utf-8"))
 from openai import OpenAI  # DeepSeek 兼容 OpenAI 接口
 
 client = OpenAI(
-    api_key="your_deepseek_api_key_here",
+    api_key="sk-85ca39c2cb214bb99d94fba35a5b8566",
     base_url="https://api.deepseek.com"
 )
 
@@ -19,7 +27,7 @@ def ask_patient(question: str) -> str:
         return "没有其他特殊症状。"  # 评估时自动回答
     print(f"\n[Agent 追问]: {question}")
     return input("[患者回答]: ")
-def risk_assess(symptoms: list, duration_days: int) -> str:
+def risk_assess(symptoms: list, duration_days: int,kb_context: str = "") -> str:
     """用LLM判断是否有红旗症状，再结合持续时间给出风险等级"""
 
     # 第一步：让LLM判断是否有危险症状
@@ -32,12 +40,12 @@ def risk_assess(symptoms: list, duration_days: int) -> str:
             "content": f"""你是一个急诊分诊专家。
 判断以下症状是否属于需要立即（2小时内）急诊处理的红旗症状。
 
-红旗症状的标准（必须满足其中之一）：
+红旗症状的标准（只要满足其中之一）：
 - 生命体征异常：意识丧失、休克、呼吸困难、大量出血
 - 急性心脑血管：胸痛伴大汗、突发剧烈头痛、口眼歪斜、半身不遂
 - 急腹症：剧烈腹痛伴板状腹、腹部外伤
 - 严重过敏：全身荨麻疹伴喉咙水肿
-
+- 潜在严重疾病信号：便血/黑便、痰中带血、咯血、无痛性血尿、不明原因消瘦、雷击样头痛、胸痛伴左臂放射、新生儿异常黄疸
 以下不属于红旗症状：
 - 慢性病就诊、复查需求
 - 普通感染（股癣、普通腹泻等）
@@ -46,13 +54,18 @@ def risk_assess(symptoms: list, duration_days: int) -> str:
 
 症状列表：{symptom_str}
 
+参考医学知识（来自知识库，请结合以下信息判断是否存在潜在严重疾病风险）：
+{kb_context if kb_context else "无"}
+
 只回答以下格式：
 危险症状：有
 原因：[具体符合哪条红旗标准]
 
 或者：
 危险症状：无
-原因：无"""
+原因：无
+注意：宁可误判为高风险，也不要漏掉潜在严重疾病，生命安全优先。
+"""
         }],
         temperature=0.0  # 判断题用0温度，要最确定的答案
     )
@@ -74,16 +87,11 @@ def risk_assess(symptoms: list, duration_days: int) -> str:
     else:
         return "风险等级：较低，可先在家观察，症状加重立即就医"
 def search_symptom(query: str) -> str:
-    """查询症状相关信息（第一周让LLM模拟返回）"""
-    # 后期可以接真实医学知识库
-    response = client.chat.completions.create(
-        model="deepseek-chat",
-        messages=[{
-            "role": "user",
-            "content": f"作为医学知识库，简洁回答：{query}，只给事实，不给建议，50字以内"
-        }]
-    )
-    return response.choices[0].message.content
+    query_vec = _model.encode([query], normalize_embeddings=True)
+    distances, indices = _index.search(query_vec, 5)
+    if distances[0][0]<0.3:
+        return "未找到相关医学信息"
+    return "\n---\n".join([_answers[i] for i in indices[0]])
 
 # 工具注册表：名字 → 函数
 TOOLS = {
@@ -96,13 +104,13 @@ TOOLS_DESCRIPTION = """
 你可以使用以下工具：
 - ask_patient(question): 向患者追问症状细节，question 是你要问的问题
 - risk_assess(symptoms, duration_days): 评估风险，symptoms 是症状列表，duration_days 是持续天数
-- search_symptom(query): 查询症状相关医学信息
+- search_symptom(query): 查询症状相关医学信息。如果结果中提到严重疾病（癌症、出血、器官衰竭等），应在后续risk_assess时把这些信息作为额外症状考虑进去。
 
 调用格式必须严格如下：
 Action: 工具名(参数)
 例如：
 Action: ask_patient("你有发烧吗？")
-Action: risk_assess(["发烧", "咳嗽"], 3)
+Action: risk_assess(["发烧", "咳嗽"], 3, kb_context="知识库返回的内容")
 Action: search_symptom("儿童发烧超过38.5度的常见原因")
 """
 
@@ -130,7 +138,8 @@ Final Answer: [给患者的建议]
 正确示例：Action: ask_patient("头痛持续几天了？")
 错误示例：Action: ask_patient("持续几天了？有没有发烧？")
 - 风险评估前必须先收集足够信息
--在最终回答之前至少调用一次risk_assess，防止有遗漏的紧急情况没发现
+- 必须先调用search_symptom收集医学背景，再调用risk_assess进行风险评估
+- 调用risk_assess时，必须将search_symptom的返回内容作为kb_context参数传入，risk_assess应结合患者症状和知识库信息综合判断风险等级，不能只依赖症状关键词
 - Final Answer 必须严格按照以下格式输出，不能省略第一行：
 风险等级：高/中/低
 可能原因：xxx
@@ -141,7 +150,7 @@ Final Answer: [给患者的建议]
 def build_prompt(question: str, history: list) -> list:
     """把对话历史拼成发给LLM的messages"""
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
-    messages.append({"role": "user", "content": f"患者描述：{question}"})
+
     # 加入历史轮次
     for item in history:
         messages.append({"role": "assistant", "content": item["agent"]})

@@ -138,11 +138,10 @@ def build_testset(
             risk_level = rule_label(answer)
             label_source = "rule"
 
-            # Step 2：LLM fallback（可选）
-            if risk_level is None and llm_client is not None:
+            # Step 2：LLM 重新标注（覆盖规则结果）
+            if llm_client is not None:
                 risk_level = llm_label(llm_client, question, answer)
                 label_source = "llm"
-                stats["llm_used"] += 1
 
             # Step 3：过滤
             if require_label and risk_level is None:
@@ -183,15 +182,25 @@ def llm_label(client, question: str, answer: str) -> Optional[str]:
             model="deepseek-chat",
             messages=[{
                 "role": "user",
-                "content": f"""你是医疗分诊专家。根据以下患者问题和医生回答，判断风险等级。
+                "content": f"""你是医疗分诊专家。根据以下患者问题和医生回答，判断患者**当前**的风险等级。
+
+注意：判断的是患者现在是否需要紧急处理，不是医生回答里提到了什么疾病。
 
 患者问题：{question[:200]}
 医生回答：{answer[:300]}
 
-只回答以下三个词之一，不要其他内容：
-高（需要急诊或立即就医）
-中（建议尽快就医检查）
-低（可在家观察或自行处理）"""
+判断标准：
+高（患者当前症状需要急诊或立即就医，2小时内处理）
+中（建议患者尽快就医检查，但不紧急）
+低（患者可在家观察或自行处理）
+
+以下情况判为低风险：
+- 症状已经好转或消失
+- 慢性病咨询、复查需求
+- 知识性问答（患者在问"是什么"而不是"我现在怎么办"）
+- 普通皮肤病、减肥、美容问题
+
+只回答一个词：高、中、或低"""
             }],
             temperature=0.0,
             max_tokens=10,
