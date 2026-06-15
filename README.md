@@ -53,6 +53,8 @@ Final Answer
 建议行动：xxx
 注意事项：xxx
 ```
+<img width="980" height="783" alt="image" src="https://github.com/user-attachments/assets/712d3c10-3257-4e9d-8cea-eeaf6eb48281" />
+
 
 ### 检索 Pipeline
 
