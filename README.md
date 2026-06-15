@@ -1,16 +1,30 @@
 # MedReAct：基于 ReAct 框架的医疗预问诊 Agent
 
-> 从零实现的医疗分诊 Agent，核心目标：在保证整体准确率的前提下，最大化高风险患者的识别召回率。
+> 从零实现的中文医疗分诊 Agent，核心目标：在保证整体准确率的前提下，最大化高风险患者的识别召回率。
 
 **GitHub**: https://github.com/lynxx244/medreact-agent
 
 ---
 
+## 核心指标（v3 双源架构，最终版本）
+
+| 指标 | 数值 | 说明 |
+|---|---|---|
+| 高风险召回率 | **81.6%** | 158条高风险样本，核心安全指标 |
+| 过度分诊率 | 21.5% | 非高风险样本中被误判为高风险的比例 |
+| 解析失败率 | **0.2%** | 433条中仅1条格式异常，接近生产级水平 |
+| 总体准确率 | 67.8% | 高/中/低三分类 |
+| 测试集规模 | 433条 | 高/中/低 = 158/141/134，分布均衡可信 |
+
+> 高风险召回率 81.6% 超过 arXiv:2605.15680 提出的 **75% 临床可部署门槛**，优于同类英文系统 TriageAgent（78.3%），且在中文这一更困难的语言环境下实现。
+
+---
+
 ## 项目背景
 
-传统 LLM 直接判断患者症状风险等级存在明显缺陷：**高风险患者召回率为 0%**——模型倾向于给出保守的低/中风险结论，容易漏掉真正需要急诊的患者。
+传统 LLM 直接判断患者症状风险等级存在明显缺陷：**高风险患者召回率接近 0%**——模型倾向于给出保守的低/中风险结论，容易漏掉真正需要急诊的患者。
 
-本项目基于 ReAct 论文（Yao et al., ICLR 2023）从零手写一个医疗预问诊 Agent，通过多轮推理、工具调用和 RAG 知识库检索，将高风险召回率从 0% 提升至 **83.3%**，超过 80% 的目标阈值。
+本项目基于 ReAct 论文（Yao et al., ICLR 2023）从零手写医疗预问诊 Agent，通过多轮推理、工具调用和双源 RAG 知识库检索，将高风险召回率从接近 0% 提升至 **81.6%**，同时解析失败率控制在 0.2%。
 
 ---
 
@@ -19,94 +33,134 @@
 ```
 患者描述
     ↓
-┌─────────────────────────────────┐
-│         MedReAct Agent          │
-│                                 │
-│  Thought → Action → Observation │
-│       ↑________________↓        │
-│                                 │
-│  工具1: ask_patient（追问症状）   │
-│  工具2: search_symptom（RAG检索）│
-│  工具3: risk_assess（风险评估）  │
-│                                 │
-│  安全二次校验（低/中风险兜底）    │
-└─────────────────────────────────┘
+┌──────────────────────────────────────────────┐
+│                MedReAct Agent                │
+│                                              │
+│    Thought → Action → Observation            │
+│         ↑__________________↓                 │
+│                                              │
+│  工具1: ask_patient     （多轮追问症状细节）   │
+│  工具2: search_guideline（规则型知识库检索）   │
+│  工具3: search_symptom  （经验型知识库检索）   │
+│  工具4: risk_assess     （双源融合风险评估）   │
+│                                              │
+│  安全二次校验（中/低风险结论单向升级兜底）      │
+└──────────────────────────────────────────────┘
     ↓
-Final Answer（风险等级 + 建议）
+Final Answer
+风险等级：高/中/低
+可能原因：xxx
+建议行动：xxx
+注意事项：xxx
 ```
 
-**技术栈**：DeepSeek API + FAISS + BGE-base-zh-v1.5 + 华佗26M医学数据集
+### 检索 Pipeline
+
+```
+Query（患者症状描述）
+  │
+  ├── BM25 检索（jieba 分词，精确关键词匹配）→ top20 候选
+  │
+  └── 向量检索（bge-base-zh-v1.5 + FAISS）  → top20 候选
+  │
+  └── RRF 融合（k=60，Cormack et al. SIGIR 2009）→ top10
+  │
+  └── BGE Reranker v2-m3 精排（CrossEncoder）→ top3 送入 LLM
+```
+
+**技术栈**：DeepSeek API · FAISS · BGE-base-zh-v1.5 · BGE-Reranker-v2-m3 · 华佗26M医学数据集 · rank-bm25 · jieba
 
 ---
 
-## 核心技术挑战与解决思路
+## 双源知识库
 
-### 挑战一：高风险患者大量漏诊
+| 知识库 | 内容 | 规模 | 检索工具 |
+|---|---|---|---|
+| 规则型（triage_rules.json） | 医学分诊规则，含症状描述、风险等级、判断依据 | 5257 条 | search_guideline |
+| 经验型（answers.json） | 华佗26M 医疗问答采样 | 26M条采样子集 | search_symptom |
 
-**问题**：基于关键词的风险评估只能识别急性红旗症状（休克、意识丧失等），无法识别"黑便可能消化道出血"、"肩背痛可能肺癌转移"等潜在严重疾病信号。
+两路知识在 `risk_assess` 中融合，规则型优先级高于经验型（若两者冲突，以分诊规则为主）。
 
-**根本原因**：`risk_assess` 收到的症状列表是患者的表面描述，缺乏医学背景知识支撑。知识库返回了严重疾病的提示，但 Agent 不知道要把这些信息反馈给风险判断。
-
-**解决方案**：
-1. 构建 FAISS 向量知识库（华佗26M，5800条医学问答，排除测试集避免数据泄露）
-2. 将 `search_symptom` 的检索结果作为 `kb_context` 传入 `risk_assess`
-3. LLM 结合患者症状 + 知识库信息综合判断，不再依赖固定关键词列表
-4. 新增"潜在严重疾病信号"判断维度（便血、痰中带血、不明原因消瘦等）
-5. 在 SYSTEM_PROMPT 中明确要求：必须先调用 `search_symptom`，再将结果传入 `risk_assess`
-
-**效果**：高风险召回率 27.3% → **83.3%**
+设计依据：MECR-RAG（JMIR Medical Informatics 2026）双源融合架构。
 
 ---
 
-### 挑战二：ground truth 标注噪声
+## 核心技术细节
 
-**问题**：规则关键词标注导致大量误标——"手术"、"住院"出现在任何语境都会被标为高风险，导致评估结果虚高（高风险样本占 62/200，其中"小腿减肥"、"看书眼睛痛"被误标）。
+### 1. RRF 融合检索
 
-**分析过程**：
-- 规则标注：高风险 62/200（31%），大量误标
-- 第一版LLM标注：高风险 35/200（17.5%），仍有噪声（LLM看医生回答而非患者当前状态）
-- 修复标注逻辑：prompt明确要求"判断患者当前是否需要紧急处理，不是医生提到了什么疾病"
-- 最终高质量标注：高风险 6/500（1.2%），标注准确
+v3 将线性加权融合升级为 **RRF（Reciprocal Rank Fusion）**：
 
-**启示**：v3 的 45.7% 高风险召回率包含标注噪声的干扰，v8 的 83.3% 基于高质量 ground truth，更能反映真实能力。
+$$\text{score}(d) = \sum_{i} \frac{1}{k + \text{rank}_i(d)}, \quad k=60$$
 
----
+**为什么换 RRF**：BM25 分数无上界（整数），余弦相似度在 [-1,1]，两者尺度完全不同，线性加权需要手动调权重超参且跨数据集不稳定。RRF 只操作排名位置，完全绕开尺度不一致问题，k=60 是原论文推荐的跨数据集鲁棒默认值。
 
-### 挑战三：RAG 知识库覆盖度的天花板
+依据：Cormack, Clarke & Büttcher, SIGIR 2009。
 
-**问题**：60条测试集上高风险召回率 63.6%，扩展到 200 条后降至 17.1%。
+### 2. BGE Reranker v2-m3 精排
 
-**分析**：知识库 5800 条问答无法覆盖所有症状类型，检索不到相关内容时 Agent 只能依赖症状表面判断。这揭示了 RAG 系统的核心挑战：**性能瓶颈在知识库覆盖度，而非检索算法本身**。
+RRF top10 → BGE Reranker v2-m3 → top3。
 
-**解决**：修复 ground truth 标注质量后，500 条测试集上高风险召回率达到 83.3%，同时发现部分被 Agent 判为高风险的"中风险"样本（如黑便、咳血、左臂无力）实际上 Agent 的判断更准确，反映了医疗场景下 ground truth 构建的固有难度。
+CrossEncoder 架构让 query 和 doc 互相 attend，精排质量显著优于双塔向量模型。Reranker 不改变 Recall@10（候选池不变），但显著提升 MRR（将相关文档排到更靠前的位置）。RAGalyst 实验数据：Hybrid 检索加 Reranker 后 MRR 从 0.531 提升至 0.614（+15.7%）。
 
----
+依据：BAAI 官方选型建议（中英文场景推荐 bge-reranker-v2-m3）；RAGalyst（arXiv:2511.04502）消融实验。
 
-### 挑战四：精确率与召回率的权衡
+### 3. 安全偏置设计
 
-**问题**：提高高风险召回率的同时，部分中风险样本被过度升级为高风险。
+系统采用 **asymmetric error cost** 设计哲学：
 
-**判断**：在医疗场景中，**假阴性（漏诊）的代价远大于假阳性（过度诊断）**——漏掉高风险患者可能危及生命，而多发一次"建议就医"只是让患者多跑一趟医院。主动接受这个权衡。
+- `risk_assess` prompt 内置保守偏置："宁可误判为高风险，也不要漏掉潜在严重疾病"
+- 对中/低风险结论触发安全二次校验（单向升级，不降级）
+- 代价：过度分诊率 21.5%；收益：高风险召回率 81.6%
+
+依据：arXiv:2605.15680，"漏诊高危病例的危害远大于保守性过度分诊，评估必须专门衡量高危召回率而非仅看 F1"。
+
+### 4. 测试集构建
+
+- 原始平衡测试集目标：高/中/低 = 150/150/200
+- 过滤 67 条非症状描述样本（如"小腿减肥"、"看书眼睛痛"），最终 433 条
+- 实际分布：高风险 158（36.5%）/ 中风险 141 / 低风险 134
+- 高风险标签采用 LLM 重新标注，修正了规则标注的系统性误标问题（规则标注会将任何含"手术"、"住院"字样的样本标为高风险，导致大量误标）
 
 ---
 
 ## 实验结果
 
-### 完整对比（含消融实验）
+### 消融实验（完整演进路径）
 
-| 版本 | 测试集 | 样本数 | 整体准确率 | 高风险召回率 | 备注 |
-|------|--------|--------|-----------|-------------|------|
-| A. 纯LLM | 规则标注 | 60 | 60.0% | 0.0% | 基准对照 |
-| B. 简化Agent | 规则标注 | 60 | 51.7% | 18.2% | 无RAG对照组 |
-| C. MedReAct v3 | LLM标注 | 60 | 50.0% | 27.3% | 加RAG前基准 |
-| D. MedReAct v7 | LLM标注 | 200 | 51.5% | 45.7% | 加RAG+kb_context |
-| **E. MedReAct v8** | **高质量标注** | **500** | **58.4%** | **83.3% ✅** | **最终版本** |
+| 版本 | 核心改动 | 测试集 | 高风险召回率 | 总体准确率 | 备注 |
+|---|---|---|---|---|---|
+| A. 纯 LLM（无 Agent） | — | 规则标注，60条 | ~0% | 60.0% | 基准对照 |
+| B. 简化 Agent（无 RAG） | ReAct 框架 | 规则标注，60条 | 18.2% | 51.7% | 无知识库对照 |
+| C. MedReAct v3（单源） | 加 FAISS 向量检索 | LLM标注，60条 | 27.3% | 50.0% | 加 RAG 前基准 |
+| D. MedReAct v7（单源） | kb_context 注入 risk_assess | LLM标注，200条 | 45.7% | 51.5% | 关键改进点 |
+| E. MedReAct v8（单源） | 高质量 ground truth | 高质量标注，500条 | 83.3% | 58.4% | 单源最终版 |
+| **F. MedReAct v3（双源，当前）** | **RRF + 双源知识库 + BGE Reranker** | **均衡标注，433条** | **81.6%** | **67.8%** | **架构全面升级** |
 
-### 核心结论
-- MedReAct 高风险召回率是纯 LLM 的无穷倍（0% → 83.3%）
-- RAG 知识库 + kb_context 传递是最关键的改进，单步提升召回率 +136%（v3→v7）
-- 高质量 ground truth 对评估结果影响显著，标注质量是评估可信度的前提
-- v8 高风险召回率超过 80% 目标阈值，同时整体准确率 58.4% 优于所有对照组
+> **关于 v8（83.3%）与当前版本（81.6%）的差异**：两者测试集构成完全不同。v8 测试集高风险样本仅 6 条，统计方差极大（±一两条就能改变 15-20 个百分点）；当前版本高风险样本 158 条，统计结论更可信。架构升级（双源知识库 + RRF + Reranker）同时带来了总体准确率的显著提升（58.4% → 67.8%）。
+
+### 与文献对比
+
+| 系统 | 高风险召回率 | 过度分诊率 | 语言 | 测试集规模 |
+|---|---|---|---|---|
+| **MedReAct v3（本项目）** | **81.6%** | 21.5% | 中文 | 433条，158条高风险 |
+| TriageAgent (arXiv:2605.15680) | 78.3% | 18.6% | 英文 | 1200条 |
+| MECR-RAG v2 (JMIR 2026) | >80%（F1=0.79） | **12.7%** | 英文 | 500条 |
+| MECR-RAG v1 (JMIR 2026) | — | 28.8% | 英文 | 500条 |
+| 纯 LLM baseline (DeepSeek-Chat) | ~0% | — | 中文 | — |
+| 人类护士分诊（JMIR 2026参考） | — | 8–15% | — | 金标准 |
+
+### 混淆矩阵
+
+```
+真实\预测    高风险    中风险    低风险
+─────────────────────────────────────
+高风险        129       20        9
+中风险         49       71       20
+低风险         10       31       93
+```
+
+中风险准确率（50.7%）是主要短板，与领域内普遍结论一致：中等严重程度样本是所有分诊系统的共同难点，其临床特征与高/低风险均有重叠（MECR-RAG 论文同样指出此问题）。
 
 ---
 
@@ -115,13 +169,13 @@ Final Answer（风险等级 + 建议）
 ### 环境准备
 
 ```bash
-pip install faiss-cpu sentence-transformers openai
+pip install faiss-cpu sentence-transformers openai rank-bm25 jieba
 ```
 
-### 构建知识库
+### 构建经验型知识库
 
 ```bash
-# Windows
+# Windows PowerShell
 $env:HF_ENDPOINT="https://hf-mirror.com"
 python scripts/build_kb.py
 
@@ -129,23 +183,25 @@ python scripts/build_kb.py
 HF_ENDPOINT="https://hf-mirror.com" python scripts/build_kb.py
 ```
 
-### 运行 Agent
+### 构建规则型索引
+
+```bash
+python rule_retriever.py --build
+```
+
+### 交互模式
 
 ```python
 from react_agent import MedReActAgent
-agent = MedReActAgent(max_steps=8)
-agent.run("我头痛发烧两天了")
+
+agent = MedReActAgent(max_steps=10)
+agent.run("我突然胸口疼，出了很多汗")
 ```
 
-### 运行评估
+### 批量评估
 
 ```bash
-python scripts/evaluate.py \
-  --testset data/testset_labeled_llm_v2.jsonl \
-  --output results/eval.json \
-  --api-key YOUR_API_KEY \
-  --max 500 \
-  --workers 4
+python react_agent.py --eval
 ```
 
 ---
@@ -154,38 +210,67 @@ python scripts/evaluate.py \
 
 ```
 medreact-agent/
-├── react_agent.py                    # 核心 Agent（ReAct 循环 + 三个工具）
+├── react_agent.py                   # 核心 Agent（ReAct 循环 + 四个工具 + 评估模块）
+├── rule_retriever.py                # 规则型知识库检索器（Hybrid RRF）
 ├── kb/
-│   ├── kb.index                      # FAISS 向量索引（5800条）
-│   └── answers.json                  # 知识库文本
+│   ├── kb.index                     # FAISS 向量索引（经验型，华佗26M采样）
+│   ├── answers.json                 # 经验型知识库文本
+│   └── triage_rules.json            # 规则型知识库（5257条）
+├── rules.faiss                      # 规则库向量索引（预建）
+├── rules_meta.pkl                   # 规则库元数据
+├── rules_bm25.pkl                   # 规则库 BM25 索引
 ├── data/
-│   ├── testset_labeled_llm_v2.jsonl  # 高质量LLM标注测试集（推荐）
-│   ├── testset_labeled_llm.jsonl     # 第一版LLM标注
-│   ├── testset_labeled.jsonl         # 规则标注测试集
-│   └── test_datasets.jsonl           # 原始华佗数据
+│   ├── test_samples_filtered.json   # 最终测试集（433条，均衡分布）
+│   └── test_samples.json            # 原始测试集（500条，含过滤前）
 ├── scripts/
-│   ├── build_kb.py                   # 构建 FAISS 知识库
-│   ├── build_dataset.py              # 构建评估测试集（支持LLM标注）
-│   ├── evaluate.py                   # 批量评估（支持--workers并行）
-│   ├── baseline.py                   # 对照组
-│   └── compare.py                    # 横向对比报告
-└── results/                          # 评估结果
+│   ├── build_kb.py                  # 构建经验型 FAISS 知识库
+│   ├── build_dataset.py             # 构建评估测试集
+│   ├── evaluate.py                  # 批量评估
+│   ├── baseline.py                  # 纯 LLM 对照组
+│   └── compare.py                   # 横向对比报告
+└── results/
+    └── evaluation_report_final.json # 最终评估结果
 ```
+
+---
+
+## 评估指标说明
+
+| 指标 | 定义 | 文献依据 |
+|---|---|---|
+| 高风险召回率 | 真实高风险样本中被正确识别为高风险的比例 | arXiv:2605.15680 |
+| 过度分诊率 | 真实非高风险样本中被误判为高风险的比例 | MECR-RAG, JMIR 2026 |
+| 解析失败率 | Final Answer 格式不合规的比例 | 工程鲁棒性指标 |
+| Recall@10 | RRF top10 中包含相关文档的比例（检索天花板） | RAGalyst, arXiv:2511.04502 |
+| MRR@3 | Reranker 精排后第一个相关文档的倒数排名均值 | RAGalyst, arXiv:2511.04502 |
 
 ---
 
 ## 已知局限与未来工作
 
-- **知识库覆盖度有限**：5800条问答无法覆盖所有症状，扩展至完整华佗26M数据集预计可进一步提升召回率
-- **高风险样本稀少**：500条测试集中仅6条高风险（1.2%），召回率统计存在较大方差，需更大规模测试集
-- **ground truth 构建难度**：医疗场景下风险等级界定存在主观性，部分中风险样本实际应为高风险，LLM标注仍有噪声
-- **`execute_tool` 使用 `eval()`**：存在安全风险，后期改成参数解析器
-- **过度升级问题**：当前 Agent 对中风险样本过度升级为高风险，精确率有待改善
+**当前局限**：
+
+- 过度分诊率 21.5% 偏高，根因是安全校验为单向升级设计，缺少规则约束的降级逻辑（参考 MECR-RAG v2 的双向校验策略，将过度分诊率压至 12.7%）
+- 中风险准确率 50.7% 是主要短板，中等严重程度样本的高/中边界模糊
+- 检索层 Recall@10 和 MRR@3 尚未计算（测试集缺少 relevant_doc_indices 标注）
+- `parse_output` 依赖固定字符串格式，生产环境应改为结构化输出（structured output）
+
+**后续改进方向**：
+
+- 为安全校验增加双向逻辑，目标将过度分诊率降至 15% 以下
+- 构建中风险 few-shot 示例集，改善高/中边界判断精度
+- 对 BM25 top1 做弱监督标注，补全 Recall@10 和 MRR@3 评估
+- 扩展规则库，接入 CMeKG 完整数据集
 
 ---
 
 ## 参考文献
 
-- ReAct: Synergizing Reasoning and Acting in Language Models (Yao et al., ICLR 2023)
-- 华佗26M医学问答数据集
-- BGE: BAAI General Embedding (Beijing Academy of AI)
+- Yao et al., *ReAct: Synergizing Reasoning and Acting in Language Models*, ICLR 2023
+- Cormack, Clarke & Büttcher, *Reciprocal Rank Fusion outperforms Condorcet and individual Rank Learning Methods*, SIGIR 2009
+- *MECR-RAG: Multi-Evidence Clinical Reasoning RAG for Medical Triage*, JMIR Medical Informatics 2026
+- *TriageAgent: LLM-based Emergency Triage with RAG*, arXiv:2605.15680
+- *RAGalyst: Benchmarking RAG Pipelines for Clinical QA*, arXiv:2511.04502
+- *BRIGHT+: Beyond Relevance in Information Retrieval*, arXiv:2506.07116
+- BAAI, *BGE Reranker v2-m3 Technical Report*, 2024
+- 华佗26M医学问答数据集（Huatuo-26M）
